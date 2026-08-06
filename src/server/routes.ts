@@ -25,12 +25,19 @@ export async function handleChatCompletions(
   res: Response
 ): Promise<void> {
   const requestId = uuidv4().replace(/-/g, "").slice(0, 24);
-  const body = req.body as OpenAIChatRequest;
-  const stream = body.stream === true;
 
   try {
+    const body = req.body as OpenAIChatRequest | null | undefined;
+
     // Validate request
-    if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
+    if (
+      !body ||
+      typeof body !== "object" ||
+      Array.isArray(body) ||
+      !body.messages ||
+      !Array.isArray(body.messages) ||
+      body.messages.length === 0
+    ) {
       res.status(400).json({
         error: {
           message: "messages is required and must be a non-empty array",
@@ -44,6 +51,7 @@ export async function handleChatCompletions(
     // Convert to CLI input format
     const cliInput = openaiToCli(body);
     const subprocess = new ClaudeSubprocess();
+    const stream = body.stream === true;
 
     if (stream) {
       await handleStreamingResponse(req, res, subprocess, cliInput, requestId);
@@ -74,6 +82,10 @@ function toOpenAICallId(claudeId: string): string {
   return `call_${claudeId.replace("toolu_", "")}`;
 }
 
+function isClaudeErrorResult(result: ClaudeCliResult): boolean {
+  return result.is_error || result.subtype === "error";
+}
+
 /**
  * Handle streaming response (SSE)
  *
@@ -101,7 +113,7 @@ async function handleStreamingResponse(
   // Send initial comment to confirm connection is alive
   res.write(":ok\n\n");
 
-  return new Promise<void>((resolve, reject) => {
+  return new Promise<void>((resolve) => {
     let isFirst = true;
     let lastModel = "claude-sonnet-4";
     let isComplete = false;
@@ -109,9 +121,28 @@ async function handleStreamingResponse(
     let toolCallIndex = 0;
     let inToolBlock = false;
 
+    const finishWithError = (message: string): void => {
+      if (isComplete) {
+        resolve();
+        return;
+      }
+      isComplete = true;
+      if (!res.writableEnded && !res.destroyed) {
+        res.write(
+          `data: ${JSON.stringify({
+            error: { message, type: "server_error", code: null },
+          })}\n\n`
+        );
+        res.write("data: [DONE]\n\n");
+        res.end();
+      }
+      resolve();
+    };
+
     // Handle actual client disconnect (response stream closed)
     res.on("close", () => {
       if (!isComplete) {
+        isComplete = true;
         // Client disconnected before response completed - kill subprocess
         subprocess.kill();
       }
@@ -121,7 +152,12 @@ async function handleStreamingResponse(
     // When a new text content block starts after we've already emitted text,
     // insert a separator so text from different blocks doesn't run together
     subprocess.on("text_block_start", () => {
-      if (hasEmittedText && !res.writableEnded) {
+      if (
+        !isComplete &&
+        hasEmittedText &&
+        !res.writableEnded &&
+        !res.destroyed
+      ) {
         const sepChunk = {
           id: `chatcmpl-${requestId}`,
           object: "chat.completion.chunk",
@@ -143,7 +179,7 @@ async function handleStreamingResponse(
     subprocess.on("content_delta", (event: ClaudeCliStreamEvent) => {
       const delta = event.event.delta;
       const text = (delta?.type === "text_delta" && delta.text) || "";
-      if (text && !res.writableEnded) {
+      if (text && !isComplete && !res.writableEnded && !res.destroyed) {
         const chunk = {
           id: `chatcmpl-${requestId}`,
           object: "chat.completion.chunk",
@@ -237,12 +273,20 @@ async function handleStreamingResponse(
 
     // Handle final assistant message (for model name)
     subprocess.on("assistant", (message: ClaudeCliAssistant) => {
+      if (isComplete) return;
       lastModel = message.message.model;
     });
 
     subprocess.on("result", (result: ClaudeCliResult) => {
+      if (isComplete) return;
+
+      if (isClaudeErrorResult(result)) {
+        finishWithError(result.result || "Claude CLI returned an error");
+        return;
+      }
+
       isComplete = true;
-      if (!res.writableEnded) {
+      if (!res.writableEnded && !res.destroyed) {
         // Send final done chunk with finish_reason and usage data
         const doneChunk = createDoneChunk(requestId, lastModel);
         if (result.usage) {
@@ -262,26 +306,27 @@ async function handleStreamingResponse(
 
     subprocess.on("error", (error: Error) => {
       console.error("[Streaming] Error:", error.message);
-      if (!res.writableEnded) {
-        res.write(
-          `data: ${JSON.stringify({
-            error: { message: error.message, type: "server_error", code: null },
-          })}\n\n`
-        );
-        res.end();
-      }
-      resolve();
+      finishWithError(error.message);
     });
 
     subprocess.on("close", (code: number | null) => {
+      if (isComplete) {
+        resolve();
+        return;
+      }
+
       // Subprocess exited - ensure response is closed
-      if (!res.writableEnded) {
-        if (code !== 0 && !isComplete) {
-          // Abnormal exit without result - send error
+      if (!res.writableEnded && !res.destroyed) {
+        if (!isComplete) {
           res.write(`data: ${JSON.stringify({
-            error: { message: `Process exited with code ${code}`, type: "server_error", code: null },
+            error: {
+              message: `Claude CLI exited with code ${code} without response`,
+              type: "server_error",
+              code: null,
+            },
           })}\n\n`);
         }
+        isComplete = true;
         res.write("data: [DONE]\n\n");
         res.end();
       }
@@ -294,7 +339,7 @@ async function handleStreamingResponse(
       sessionId: cliInput.sessionId,
     }).catch((err) => {
       console.error("[Streaming] Subprocess start error:", err);
-      reject(err);
+      finishWithError(err instanceof Error ? err.message : String(err));
     });
   });
 }
@@ -310,6 +355,16 @@ async function handleNonStreamingResponse(
 ): Promise<void> {
   return new Promise((resolve) => {
     let finalResult: ClaudeCliResult | null = null;
+    let isComplete = false;
+    let clientDisconnected = false;
+
+    res.on("close", () => {
+      if (!isComplete) {
+        clientDisconnected = true;
+        subprocess.kill();
+      }
+      resolve();
+    });
     // DISABLED: see tool call forwarding comment in handleStreamingResponse
     // const accumulatedToolCalls: OpenAIToolCall[] = [];
     //
@@ -334,18 +389,35 @@ async function handleNonStreamingResponse(
 
     subprocess.on("error", (error: Error) => {
       console.error("[NonStreaming] Error:", error.message);
-      res.status(500).json({
-        error: {
-          message: error.message,
-          type: "server_error",
-          code: null,
-        },
-      });
+      isComplete = true;
+      if (!res.headersSent && !res.destroyed) {
+        res.status(500).json({
+          error: {
+            message: error.message,
+            type: "server_error",
+            code: null,
+          },
+        });
+      }
       resolve();
     });
 
     subprocess.on("close", (code: number | null) => {
-      if (finalResult) {
+      isComplete = true;
+      if (clientDisconnected || res.destroyed || res.writableEnded) {
+        resolve();
+        return;
+      }
+
+      if (finalResult && isClaudeErrorResult(finalResult)) {
+        res.status(500).json({
+          error: {
+            message: finalResult.result || "Claude CLI returned an error",
+            type: "server_error",
+            code: null,
+          },
+        });
+      } else if (finalResult) {
         res.json(cliResultToOpenai(finalResult, requestId));
       } else if (!res.headersSent) {
         res.status(500).json({
@@ -366,13 +438,16 @@ async function handleNonStreamingResponse(
         sessionId: cliInput.sessionId,
       })
       .catch((error) => {
-        res.status(500).json({
-          error: {
-            message: error.message,
-            type: "server_error",
-            code: null,
-          },
-        });
+        isComplete = true;
+        if (!res.headersSent && !res.destroyed) {
+          res.status(500).json({
+            error: {
+              message: error.message,
+              type: "server_error",
+              code: null,
+            },
+          });
+        }
         resolve();
       });
   });

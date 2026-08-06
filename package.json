@@ -12,8 +12,9 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/server/standalone.js",
-    "test": "node --test dist/**/*.test.js",
-    "clean": "rm -rf dist",
+    "test": "npm run clean && npm run build && cd dist && node --test",
+    "test:e2e": "npm run build && node --test dist/e2e.test.js",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

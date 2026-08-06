@@ -29,6 +29,12 @@ Thank you for your interest in contributing!
 Test your changes with:
 
 ```bash
+# Offline reliability and contract tests (does not use a Claude subscription)
+npm test
+
+# Live Claude CLI tests (requires and uses an authenticated subscription)
+npm run test:e2e
+
 # Start the server
 node dist/server/standalone.js
 

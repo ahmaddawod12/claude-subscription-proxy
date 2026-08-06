@@ -7,8 +7,7 @@
 
 import { spawn, ChildProcess } from "child_process";
 import { EventEmitter } from "events";
-import fs from "fs/promises";
-import path from "path";
+import { StringDecoder } from "string_decoder";
 import type {
   ClaudeCliMessage,
   ClaudeCliAssistant,
@@ -91,8 +90,14 @@ const OPENCLAW_TOOL_MAPPING_PROMPT = [
 export class ClaudeSubprocess extends EventEmitter {
   private process: ChildProcess | null = null;
   private buffer: string = "";
+  private decoder = new StringDecoder("utf8");
   private timeoutId: NodeJS.Timeout | null = null;
   private isKilled: boolean = false;
+  private killSignal: NodeJS.Signals = "SIGTERM";
+
+  constructor(private readonly spawnProcess: typeof spawn = spawn) {
+    super();
+  }
 
   /**
    * Start the Claude CLI subprocess with the given prompt
@@ -101,51 +106,111 @@ export class ClaudeSubprocess extends EventEmitter {
     const args = this.buildArgs(options);
     const timeout = options.timeout || DEFAULT_TIMEOUT;
 
+    this.buffer = "";
+    this.decoder = new StringDecoder("utf8");
+    this.isKilled = false;
+    this.killSignal = "SIGTERM";
+
     return new Promise((resolve, reject) => {
+      let startSettled = false;
+      let terminalErrorHandled = false;
+
       try {
         // Use spawn() for security - no shell interpretation
-        this.process = spawn(process.env.CLAUDE_BIN || "claude", args, {
+        const child = this.spawnProcess(process.env.CLAUDE_BIN || "claude", args, {
           cwd: options.cwd || process.cwd(),
           env: Object.fromEntries(
             Object.entries(process.env).filter(([k]) => k !== "CLAUDECODE")
           ),
           stdio: ["pipe", "pipe", "pipe"],
         });
+        this.process = child;
+
+        const reportProcessError = (input: unknown): void => {
+          if (terminalErrorHandled) return;
+          terminalErrorHandled = true;
+          this.clearTimeout();
+
+          const originalError =
+            input instanceof Error ? input : new Error(String(input));
+          const error =
+            (originalError as NodeJS.ErrnoException).code === "ENOENT" ||
+            originalError.message.includes("ENOENT")
+              ? new Error(
+                  "Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code"
+                )
+              : originalError;
+
+          if (!startSettled) {
+            startSettled = true;
+            reject(error);
+          } else {
+            this.emit("error", error);
+          }
+        };
 
         // Set timeout
         this.timeoutId = setTimeout(() => {
           if (!this.isKilled) {
             this.isKilled = true;
-            this.process?.kill("SIGTERM");
-            this.emit("error", new Error(`Request timed out after ${timeout}ms`));
+            this.killSignal = "SIGTERM";
+            child.kill(this.killSignal);
+            reportProcessError(new Error(`Request timed out after ${timeout}ms`));
           }
         }, timeout);
 
         // Handle spawn errors (e.g., claude not found)
-        this.process.on("error", (err) => {
-          this.clearTimeout();
-          if (err.message.includes("ENOENT")) {
-            reject(
-              new Error(
-                "Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code"
-              )
-            );
-          } else {
-            reject(err);
+        child.on("error", (err) => {
+          this.isKilled = true;
+          reportProcessError(err);
+        });
+
+        // stdin is a separate stream and can emit EPIPE/EOF without a child error
+        child.stdin?.on("error", (err) => {
+          if (!this.isKilled) {
+            this.isKilled = true;
+            this.killSignal = "SIGTERM";
+            child.kill(this.killSignal);
+          }
+          reportProcessError(err);
+        });
+
+        child.once("spawn", () => {
+          try {
+            if (this.isKilled) {
+              child.kill(this.killSignal);
+              if (!startSettled) {
+                startSettled = true;
+                resolve();
+              }
+              return;
+            }
+
+            // Pass prompt via stdin to avoid E2BIG on large inputs
+            child.stdin?.write(prompt);
+            child.stdin?.end();
+
+            if (process.env.DEBUG_SUBPROCESS) {
+              console.error(`[Subprocess] Process spawned with PID: ${child.pid}`);
+            }
+
+            if (!startSettled) {
+              startSettled = true;
+              resolve();
+            }
+          } catch (error) {
+            if (!this.isKilled) {
+              this.isKilled = true;
+              this.killSignal = "SIGTERM";
+              child.kill(this.killSignal);
+            }
+            reportProcessError(error);
           }
         });
 
-        // Pass prompt via stdin to avoid E2BIG on large inputs
-        this.process.stdin?.write(prompt);
-        this.process.stdin?.end();
-
-        if (process.env.DEBUG_SUBPROCESS) {
-          console.error(`[Subprocess] Process spawned with PID: ${this.process.pid}`);
-        }
-
         // Parse JSON stream from stdout
-        this.process.stdout?.on("data", (chunk: Buffer) => {
-          const data = chunk.toString();
+        child.stdout?.on("data", (chunk: Buffer) => {
+          const data = this.decoder.write(chunk);
           if (process.env.DEBUG_SUBPROCESS) {
             console.error(`[Subprocess] Received ${data.length} bytes of stdout`);
           }
@@ -154,7 +219,7 @@ export class ClaudeSubprocess extends EventEmitter {
         });
 
         // Capture stderr for debugging
-        this.process.stderr?.on("data", (chunk: Buffer) => {
+        child.stderr?.on("data", (chunk: Buffer) => {
           const errorText = chunk.toString().trim();
           if (errorText) {
             // Don't emit as error unless it's actually an error
@@ -166,22 +231,18 @@ export class ClaudeSubprocess extends EventEmitter {
         });
 
         // Handle process close
-        this.process.on("close", (code) => {
+        child.on("close", (code) => {
           if (process.env.DEBUG_SUBPROCESS) {
             console.error(`[Subprocess] Process closed with code: ${code}`);
           }
           this.clearTimeout();
-          // Process any remaining buffer
-          if (this.buffer.trim()) {
-            this.processBuffer();
-          }
+          this.buffer += this.decoder.end();
+          this.processBuffer(true);
           this.emit("close", code);
         });
-
-        // Resolve immediately since we're streaming
-        resolve();
       } catch (err) {
         this.clearTimeout();
+        startSettled = true;
         reject(err);
       }
     });
@@ -216,9 +277,9 @@ export class ClaudeSubprocess extends EventEmitter {
   /**
    * Process the buffer and emit parsed messages
    */
-  private processBuffer(): void {
+  private processBuffer(flush: boolean = false): void {
     const lines = this.buffer.split("\n");
-    this.buffer = lines.pop() || ""; // Keep incomplete line
+    this.buffer = flush ? "" : lines.pop() || ""; // Keep incomplete line
 
     for (const line of lines) {
       const trimmed = line.trim();
@@ -276,6 +337,7 @@ export class ClaudeSubprocess extends EventEmitter {
   kill(signal: NodeJS.Signals = "SIGTERM"): void {
     if (!this.isKilled && this.process) {
       this.isKilled = true;
+      this.killSignal = signal;
       this.clearTimeout();
       this.process.kill(signal);
     }

@@ -14,6 +14,14 @@ export interface ServerConfig {
 }
 
 let serverInstance: Server | null = null;
+let serverStartPromise: Promise<Server> | null = null;
+let serverStopPromise: Promise<void> | null = null;
+
+interface ApiError extends Error {
+  status?: number;
+  apiType?: string;
+  apiCode?: string | null;
+}
 
 /**
  * Create and configure the Express app
@@ -43,7 +51,13 @@ function createApp(): Express {
             url: req.originalUrl,
           });
         }
-        return next(err);
+        const parseError = new Error(
+          "Request body contains invalid JSON"
+        ) as ApiError;
+        parseError.status = 400;
+        parseError.apiType = "invalid_request_error";
+        parseError.apiCode = "invalid_json";
+        return next(parseError);
       }
     }
     next();
@@ -87,13 +101,21 @@ function createApp(): Express {
   });
 
   // Error handler
-  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((err: ApiError, _req: Request, res: Response, _next: NextFunction) => {
     console.error("[Server Error]:", err.message);
-    res.status(500).json({
+    const status =
+      typeof err.status === "number" && err.status >= 400 && err.status < 600
+        ? err.status
+        : 500;
+    const isClientError = status < 500;
+
+    res.status(status).json({
       error: {
         message: err.message,
-        type: "server_error",
-        code: null,
+        type:
+          err.apiType ||
+          (isClientError ? "invalid_request_error" : "server_error"),
+        code: err.apiCode ?? null,
       },
     });
   });
@@ -107,47 +129,128 @@ function createApp(): Express {
 export async function startServer(config: ServerConfig): Promise<Server> {
   const { port, host = "127.0.0.1" } = config;
 
+  if (serverStopPromise) {
+    console.log("[Server] Shutdown in progress, waiting before restart");
+    await serverStopPromise;
+    return startServer(config);
+  }
+
+  if (serverStartPromise) {
+    console.log("[Server] Startup already in progress, waiting for it");
+    return serverStartPromise;
+  }
+
   if (serverInstance) {
     console.log("[Server] Already running, returning existing instance");
     return serverInstance;
   }
 
   const app = createApp();
+  const server = createServer(app);
+  serverInstance = server;
 
-  return new Promise((resolve, reject) => {
-    serverInstance = createServer(app);
-
-    serverInstance.on("error", (err: NodeJS.ErrnoException) => {
-      if (err.code === "EADDRINUSE") {
-        reject(new Error(`Port ${port} is already in use`));
-      } else {
-        reject(err);
-      }
-    });
-
-    serverInstance.listen(port, host, () => {
-      console.log(`[Server] Claude Code CLI provider running at http://${host}:${port}`);
-      console.log(`[Server] OpenAI-compatible endpoint: http://${host}:${port}/v1/chat/completions`);
-      resolve(serverInstance!);
-    });
+  let resolveStart!: (server: Server) => void;
+  let rejectStart!: (error: unknown) => void;
+  const startPromise = new Promise<Server>((resolve, reject) => {
+    resolveStart = resolve;
+    rejectStart = reject;
   });
+  serverStartPromise = startPromise;
+
+  const clearPendingStart = (): void => {
+    if (serverStartPromise === startPromise) {
+      serverStartPromise = null;
+    }
+  };
+  const handleStartupError = (err: NodeJS.ErrnoException): void => {
+    clearPendingStart();
+    if (serverInstance === server) {
+      serverInstance = null;
+    }
+    if (err.code === "EADDRINUSE") {
+      rejectStart(new Error(`Port ${port} is already in use`));
+    } else {
+      rejectStart(err);
+    }
+  };
+  server.once("error", handleStartupError);
+
+  try {
+    server.listen(port, host, () => {
+      server.off("error", handleStartupError);
+      server.on("error", (error) => {
+        console.error("[Server] Runtime error:", error.message);
+      });
+      clearPendingStart();
+      console.log(
+        `[Server] Claude Code CLI provider running at http://${host}:${port}`
+      );
+      console.log(
+        `[Server] OpenAI-compatible endpoint: http://${host}:${port}/v1/chat/completions`
+      );
+      resolveStart(server);
+    });
+  } catch (error) {
+    server.off("error", handleStartupError);
+    clearPendingStart();
+    if (serverInstance === server) {
+      serverInstance = null;
+    }
+    rejectStart(error);
+  }
+
+  return startPromise;
 }
 
 /**
  * Stop the HTTP server
  */
 export async function stopServer(): Promise<void> {
+  if (serverStopPromise) {
+    return serverStopPromise;
+  }
+
+  const stopOperation = performStop();
+  serverStopPromise = stopOperation;
+
+  try {
+    await stopOperation;
+  } finally {
+    if (serverStopPromise === stopOperation) {
+      serverStopPromise = null;
+    }
+  }
+}
+
+async function performStop(): Promise<void> {
+  const pendingStart = serverStartPromise;
+  if (pendingStart) {
+    try {
+      await pendingStart;
+    } catch {
+      return;
+    }
+  }
+
   if (!serverInstance) {
     return;
   }
 
+  const server = serverInstance;
+  if (!server.listening) {
+    serverInstance = null;
+    return;
+  }
+
   return new Promise((resolve, reject) => {
-    serverInstance!.close((err) => {
+    server.close((err) => {
+      if (serverInstance === server) {
+        serverInstance = null;
+      }
       if (err) {
         reject(err);
       } else {
         console.log("[Server] Stopped");
-        serverInstance = null;
         resolve();
       }
     });
